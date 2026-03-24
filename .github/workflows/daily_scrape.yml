@@ -1,0 +1,63 @@
+name: Daily Price Scraper
+
+on:
+  # Run every day at 7:00 AM Eastern (11:00 UTC)
+  schedule:
+    - cron: "0 11 * * *"
+
+  # Allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to commit docs/latest.json back to the repo
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Check out the repo ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install Python dependencies ────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 playwright pandas rich lxml
+
+      # ── 4. Install Playwright browser (Chromium only to keep it fast) ─────
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 5. Run the scraper ────────────────────────────────────────────────
+      - name: Run price scraper
+        run: python construction_price_scraper.py
+
+      # ── 6. Commit docs/latest.json back to the repo ───────────────────────
+      #    GitHub Pages will serve this file so the dashboard always has
+      #    fresh data without needing a separate API or database.
+      - name: Commit updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/latest.json output/
+          # Only commit if something actually changed
+          git diff --cached --quiet || git commit -m "chore: price update $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+
+      # ── 7. Upload full output folder as a downloadable artifact ──────────
+      - name: Upload output artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-data-${{ github.run_id }}
+          path: output/
+          retention-days: 90
