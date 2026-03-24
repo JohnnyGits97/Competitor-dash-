@@ -78,6 +78,48 @@ def parse_price(text: str):
 def rate_limit(seconds: float = 1.2):
     time.sleep(seconds)
 
+def make_stealth_browser(pw):
+    """
+    Launch a stealth Chromium instance that bypasses common bot-detection checks.
+    Key flags:
+      --disable-http2           avoids ERR_HTTP2_PROTOCOL_ERROR on Akamai/Cloudflare CDNs
+      --disable-blink-features  removes the navigator.webdriver fingerprint
+    Returns (browser, page) ready to use.
+    """
+    browser = pw.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-http2",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    ctx = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        locale="en-CA",
+        extra_http_headers={
+            "Accept-Language": "en-CA,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-ch-ua": '"Chromium";v="124","Not-A.Brand";v="8"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    page = ctx.new_page()
+    # Mask the webdriver property so JS-based bot checks see a real browser
+    page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return browser, page
+
 # ---------------------------------------------------------------------------
 # SCRAPER 1 - Biiibo (biiibo.com)
 # ---------------------------------------------------------------------------
@@ -183,7 +225,7 @@ def scrape_ihl_collection(base_url: str, category: str) -> list:
     products = []
     page = 1
     while True:
-        json_url = f"{base_url}.json?limit=250&page={page}"
+        json_url = f"{base_url}/products.json?limit=250&page={page}"
         try:
             resp = requests.get(json_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
@@ -271,34 +313,41 @@ def scrape_homedepot_playwright() -> list:
     products = []
     console.rule("[bold orange1]Scraping Home Depot Canada (Playwright)[/bold orange1]")
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=HEADERS["User-Agent"], locale="en-CA")
-        page = ctx.new_page()
+        browser, page = make_stealth_browser(pw)
         for search_name, url in HOME_DEPOT_SEARCHES.items():
+            cat_count_before = len(products)
             try:
-                page.goto(url, timeout=30000, wait_until="networkidle")
-                page.wait_for_timeout(2500)
-                page.wait_for_selector("[class*='product-pod'], [data-testid*='product']", timeout=10000)
-                cards = page.query_selector_all("[class*='product-pod'], [data-testid*='product-card']")
-                for card in cards[:20]:
+                # Use domcontentloaded — networkidle never resolves on HD's Angular app
+                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                # Wait for Angular to render product cards (confirmed class: acl-product-card)
+                page.wait_for_selector(".acl-product-card", timeout=20000)
+                page.wait_for_timeout(1500)
+                cards = page.query_selector_all(".acl-product-card")
+                for card in cards[:25]:
                     try:
-                        name_el = card.query_selector("[class*='product-title'], h3, h4")
-                        price_el = card.query_selector("[class*='price__value'], [data-testid*='price']")
-                        sku_el = card.get_attribute("data-product-id") or ""
-                        name = name_el.inner_text().strip() if name_el else ""
+                        # BEM child elements: acl-product-card__description / acl-product-card__price
+                        name_el = card.query_selector(
+                            "[class*='description'], [class*='title'], h2, h3, h4, a[class*='link']"
+                        )
+                        price_el = card.query_selector("[class*='price']")
+                        sku_el   = card.query_selector("[class*='model'], [class*='sku'], [class*='internet']")
+                        name  = name_el.inner_text().strip() if name_el else ""
                         price = parse_price(price_el.inner_text()) if price_el else None
+                        sku   = sku_el.inner_text().strip() if sku_el else (
+                            card.get_attribute("data-product-id") or ""
+                        )
                         if name and price:
                             products.append(Product(
                                 supplier="Home Depot CA", category=search_name,
-                                name=name, sku=sku_el, price_cad=price,
+                                name=name, sku=sku, price_cad=price,
                                 pro_price=None, unit="each", url=url,
                             ))
                     except Exception:
                         continue
-                log.info(f"  Home Depot CA [{search_name}]: {len([p for p in products if p.category == search_name])}")
-                time.sleep(2)
             except Exception as e:
                 log.warning(f"  Home Depot CA [{search_name}] error: {e}")
+            log.info(f"  Home Depot CA [{search_name}]: {len(products) - cat_count_before} products")
+            time.sleep(2)
         browser.close()
     return products
 
@@ -320,33 +369,62 @@ def scrape_rona_playwright() -> list:
         return []
     products = []
     console.rule("[bold red]Scraping RONA (Playwright)[/bold red]")
+
+    # RONA product-tile selectors (WebSphere Commerce / custom theme)
+    RONA_CARD_SEL = (
+        "[class*='product-listing-item'], "
+        "[class*='product-tile'], "
+        "[class*='productTile'], "
+        "[id*='CatalogEntryWidget'], "
+        "li.grid-item, "
+        "div.col-sm-3.col-xs-6"          # fallback: Bootstrap grid cells used as product wrappers
+    )
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=HEADERS["User-Agent"], locale="en-CA")
-        page = ctx.new_page()
+        browser, page = make_stealth_browser(pw)
+
+        # Warm up with the home page first so we have a valid session & cookies
+        try:
+            page.goto("https://www.rona.ca/en", timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
         for search_name, url in RONA_SEARCHES.items():
+            cat_count_before = len(products)
             try:
-                page.goto(url, timeout=30000, wait_until="networkidle")
-                page.wait_for_timeout(3000)
-                cards = page.query_selector_all("[class*='product-card'], article[class*='product']")
-                for card in cards[:20]:
+                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                # Give the JS search engine time to inject results
+                page.wait_for_timeout(5000)
+                # Try to wait for a product tile to confirm results loaded
+                try:
+                    page.wait_for_selector(RONA_CARD_SEL, timeout=15000)
+                except Exception:
+                    pass  # Continue anyway — try to scrape whatever rendered
+
+                cards = page.query_selector_all(RONA_CARD_SEL)
+                for card in cards[:25]:
                     try:
-                        name_el = card.query_selector("[class*='title'], h3, h4")
-                        price_el = card.query_selector("[class*='price'], [data-testid*='price']")
-                        name = name_el.inner_text().strip() if name_el else ""
+                        name_el  = card.query_selector("[class*='title'], [class*='name'], h2, h3, h4, a")
+                        price_el = card.query_selector("[class*='price'], [class*='Prix']")
+                        name  = name_el.inner_text().strip() if name_el else ""
                         price = parse_price(price_el.inner_text()) if price_el else None
+                        link_el = card.query_selector("a[href]")
+                        href  = link_el.get_attribute("href") if link_el else url
+                        if href and not href.startswith("http"):
+                            href = "https://www.rona.ca" + href
                         if name and price:
                             products.append(Product(
                                 supplier="RONA", category=search_name,
                                 name=name, sku="", price_cad=price,
-                                pro_price=None, unit="each", url=url,
+                                pro_price=None, unit="each", url=href or url,
                             ))
                     except Exception:
                         continue
-                log.info(f"  RONA [{search_name}]: {len([p for p in products if p.category == search_name])}")
-                time.sleep(2)
             except Exception as e:
                 log.warning(f"  RONA [{search_name}] error: {e}")
+            log.info(f"  RONA [{search_name}]: {len(products) - cat_count_before} products")
+            time.sleep(2)
         browser.close()
     return products
 
@@ -466,6 +544,8 @@ def print_comparison_report(df: pd.DataFrame):
 
 def save_outputs(all_products: list, df: pd.DataFrame):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ── timestamped output folder (artifact / local runs) ──────────────────
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
     raw_path = out_dir / f"raw_products_{ts}.csv"
@@ -483,6 +563,19 @@ def save_outputs(all_products: list, df: pd.DataFrame):
         json.dump([asdict(p) for p in all_products], f, indent=2, default=str)
     log.info(f"Saved: {json_path}")
 
+    # ── docs/latest.json — served by GitHub Pages to the dashboard ─────────
+    docs_dir = Path("docs")
+    docs_dir.mkdir(exist_ok=True)
+    latest_payload = {
+        "scraped_at": datetime.now().isoformat(),
+        "total_products": len(all_products),
+        "products": [asdict(p) for p in all_products],
+    }
+    latest_path = docs_dir / "latest.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(latest_payload, f, indent=2, default=str)
+    log.info(f"Saved: {latest_path}  ← GitHub Pages dashboard feed")
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
@@ -491,18 +584,30 @@ def main():
     console.print(
         "[bold]Construction Material Price Scraper[/bold]\n"
         f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        "Suppliers: Biiibo · IHL Canada · Home Depot CA · RONA · Yvon Building Supply\n"
+        "Suppliers: Biiibo · IHL Canada · Home Depot CA · RONA\n"
     )
     all_products = []
     all_products.extend(scrape_biiibo())
     all_products.extend(scrape_ihl())
-    all_products.extend(scrape_yvon())
     all_products.extend(scrape_homedepot_playwright())
     all_products.extend(scrape_rona_playwright())
+
     console.print(f"\n[bold]Total products scraped:[/bold] {len(all_products)}")
+
+    # Per-supplier summary
+    suppliers = {}
+    for p in all_products:
+        suppliers[p.supplier] = suppliers.get(p.supplier, 0) + 1
+    for supplier, count in suppliers.items():
+        status = "[green]✓[/green]" if count > 0 else "[red]✗[/red]"
+        console.print(f"  {status} {supplier}: {count} products")
+
     if not all_products:
-        console.print("[red]No products scraped. Check network and site structure.[/red]")
+        console.print("[yellow]No products scraped this run — check logs above for errors.[/yellow]")
+        console.print("[yellow]Exiting without writing output (no data to save).[/yellow]")
+        # Exit 0 so the workflow doesn't fail the commit step on first run
         return
+
     df = build_comparison_table(all_products)
     print_comparison_report(df)
     save_outputs(all_products, df)
