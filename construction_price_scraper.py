@@ -1,6 +1,7 @@
 """
 Construction Material Price Scraper & Analyzer
-Targets: Biiibo, IHL Canada, Home Depot CA, RONA, Yvon Building Supply
+Targets: Biiibo, IHL Canada, Home Depot CA, RONA, Yvon Building Supply,
+         New Canadian Lumber, Downtown Lumber
 Outputs: CSV + console comparison report
 
 Requirements:
@@ -461,19 +462,165 @@ def scrape_yvon() -> list:
     return products
 
 # ---------------------------------------------------------------------------
+# SCRAPER 6 - New Canadian Lumber (shop.newcanadianslumber.com) — Toolbx SPA
+# ---------------------------------------------------------------------------
+#
+# Both New Canadian Lumber and Downtown Lumber run on the Toolbx e-commerce
+# platform — a React + GraphQL SPA.  Every search query returns the same full
+# catalog (~68 rows, ~26-28 unique URLs), so a single "lumber" search is
+# sufficient.  Products are rendered client-side, so Playwright is required.
+#
+# Selector strategy (verified March 2026):
+#   Wait for:  [class*="tbx-product-tile"]
+#   Price col: [class*="tbx-product-tile-price-column"]
+#   Name:      first non-price, non-SKU, non-button line of the anchor's
+#              innerText (Toolbx uses Styled Components random class names)
+# ---------------------------------------------------------------------------
+
+_TOOLBX_WAIT_SEL  = "[class*='tbx-product-tile']"
+_TOOLBX_PRICE_SEL = "[class*='tbx-product-tile-price-column']"
+_TOOLBX_TIMEOUT   = 30_000   # ms — React/GraphQL cold load needs headroom
+_TOOLBX_SETTLE    = 3_000    # ms — wait for GraphQL search results to populate
+
+_TOOLBX_JS = """
+() => {
+    const results = [];
+    const priceEls = document.querySelectorAll('[class*="tbx-product-tile-price-column"]');
+    priceEls.forEach(priceEl => {
+        try {
+            // Walk up DOM to find the product card that contains both a link and the price
+            let card = priceEl;
+            for (let i = 0; i < 15; i++) {
+                if (!card.parentElement) break;
+                card = card.parentElement;
+                const link = card.querySelector('a[href]');
+                if (link && card.innerText.length > 20) break;
+            }
+            const linkEl   = card.querySelector('a[href]');
+            const priceText = priceEl.innerText.trim();
+            // Name: first non-price / non-SKU / non-button line in the link text
+            let name = 'Unknown';
+            if (linkEl) {
+                const lines = linkEl.innerText.trim().split('\\n')
+                    .map(l => l.trim())
+                    .filter(l => l && !l.startsWith('SKU:') && !l.startsWith('$')
+                                && l !== 'Add' && l !== 'Add To Cart');
+                if (lines.length > 0) name = lines[0];
+            }
+            if (linkEl && priceText) {
+                results.push({
+                    name:        name,
+                    url:         linkEl.href,
+                    priceText:   priceText,
+                    inStockText: card.innerText.toLowerCase(),
+                });
+            }
+        } catch(e) {}
+    });
+    return results;
+}
+"""
+
+
+def _scrape_toolbx(supplier: str, base_url: str) -> list:
+    """
+    Shared Toolbx scraper used by both NCL and Downtown Lumber.
+    Returns a list of Product objects.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning(f"Playwright not installed — skipping {supplier}")
+        return []
+
+    products = []
+    search_url = f"{base_url}/search?q=lumber"
+
+    with sync_playwright() as pw:
+        browser, page = make_stealth_browser(pw)
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=_TOOLBX_TIMEOUT)
+            page.wait_for_selector(_TOOLBX_WAIT_SEL, timeout=_TOOLBX_TIMEOUT)
+            page.wait_for_timeout(_TOOLBX_SETTLE)   # let GraphQL populate names
+
+            raw = page.evaluate(_TOOLBX_JS)
+
+            seen_urls = set()
+            for item in raw:
+                url = item.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                price_text = item.get("priceText", "")
+                price = parse_price(price_text)
+                in_stock = "out of stock" not in item.get("inStockText", "")
+
+                if price is not None:
+                    products.append(Product(
+                        supplier=supplier,
+                        category="Building Materials",
+                        name=item.get("name", "Unknown").strip(),
+                        sku="",
+                        price_cad=price,
+                        pro_price=None,
+                        unit="each",
+                        url=url,
+                    ))
+
+        except Exception as exc:
+            log.error(f"  {supplier} Playwright error: {exc}")
+        finally:
+            browser.close()
+
+    log.info(f"  {supplier}: {len(products)} unique products scraped")
+    return products
+
+
+def scrape_new_canadian_lumber() -> list:
+    console.rule("[bold cyan]Scraping New Canadian Lumber (Toolbx)[/bold cyan]")
+    return _scrape_toolbx("New Canadian Lumber", "https://shop.newcanadianslumber.com")
+
+
+def scrape_downtown_lumber() -> list:
+    console.rule("[bold yellow]Scraping Downtown Lumber (Toolbx)[/bold yellow]")
+    return _scrape_toolbx("Downtown Lumber", "https://www.downtownlumber.com")
+
+
+# ---------------------------------------------------------------------------
 # ANALYSIS ENGINE
 # ---------------------------------------------------------------------------
 
 BENCHMARK_KEYWORDS = {
-    "2x4x8 Spruce":           ["2 in. x 4 in. x 8 ft. Spruce", "2x4x8 SPF", "2x4x8"],
-    "2x4x10 Spruce":          ["2 in. x 4 in. x 10 ft. Spruce", "2x4x10 SPF", "2x4x10"],
-    "2x6x8 Spruce":           ["2 in. x 6 in. x 8 ft. Spruce", "2x6x8 SPF", "2x6x8"],
-    "2x6x10 Spruce":          ["2 in. x 6 in. x 10 ft. Spruce", "2x6x10 SPF", "2x6x10"],
-    "1/2 Drywall 4x8":        ["1/2 in. x 4 ft. x 8 ft", "1/2in Drywall"],
-    "7/16 OSB 4x8":           ["7/16 in. x 4 ft. x 8 ft. OSB", "7/16 OSB"],
-    "1/2 Spruce Plywood":     ["1/2 in. x 4 ft. x 8 ft. Standard Spruce Plywood"],
-    "3/4 Spruce Plywood":     ["3/4 in. x 4 ft. x 8 ft. Standard Spruce Plywood"],
-    "2x4x8 Pressure Treated": ["2 in. x 4 in. x 8 ft. Brown Pressure Treated", "2x4 Treated"],
+    "2x4x8 Spruce":           ["2 in. x 4 in. x 8 ft. Spruce", "2x4x8 SPF", "2x4x8 SPF",
+                               "2x4x8' Premium SPF", "2x4x8"],
+    "2x4x10 Spruce":          ["2 in. x 4 in. x 10 ft. Spruce", "2x4x10 SPF",
+                               "2x4x10' Premium SPF", "2x4x10"],
+    "2x4x12 Spruce":          ["2x4x12 SPF", "2x4x12' Premium SPF", "2x4x12"],
+    "2x4x16 Spruce":          ["2x4x16 SPF", "2x4x16' Premium SPF", "2x4x16"],
+    "2x6x8 Spruce":           ["2 in. x 6 in. x 8 ft. Spruce", "2x6x8 SPF",
+                               "2x6x8' Premium SPF", "2x6x8"],
+    "2x6x10 Spruce":          ["2 in. x 6 in. x 10 ft. Spruce", "2x6x10 SPF",
+                               "2x6x10' Premium SPF", "2x6x10"],
+    "2x6x12 Spruce":          ["2x6x12 SPF", "2x6x12' Premium SPF", "2x6x12"],
+    "2x12x12 Spruce":         ["2x12x12 SPF", "2x12x12' Premium SPF", "2x12x12"],
+    "1/2 Drywall 4x8":        ["1/2 in. x 4 ft. x 8 ft", "1/2in Drywall",
+                               "4x8x1/2\" Lite-Weight Drywall", "4x8x1/2"],
+    "1/2 Drywall 4x10":       ["4x10x1/2\" Lite-Weight Drywall", "4x10x1/2"],
+    "7/16 OSB 4x8":           ["7/16 in. x 4 ft. x 8 ft. OSB", "7/16 OSB",
+                               "4x8x7/16\" OSB", "4x8x7/16"],
+    "1/2 Spruce Plywood":     ["1/2 in. x 4 ft. x 8 ft. Standard Spruce Plywood",
+                               "4x8x1/2\" Standard Spruce Plywood",
+                               "4x8x1/2\" Standard SPF Plywood"],
+    "3/4 Spruce Plywood":     ["3/4 in. x 4 ft. x 8 ft. Standard Spruce Plywood",
+                               "4x8x3/4\" Standard Spruce Plywood",
+                               "4x8x3/4\" Standard SPF Plywood"],
+    "5/8 Spruce Plywood":     ["4x8x5/8\" Standard Spruce Plywood",
+                               "4x8x5/8\" Standard SPF Plywood"],
+    "3/8 Spruce Plywood":     ["4x8x3/8\" Standard SPF Plywood"],
+    "2x4x8 Pressure Treated": ["2 in. x 4 in. x 8 ft. Brown Pressure Treated", "2x4 Treated",
+                               "2x4x8' Sienna Pressure Treated"],
+    "2x4x10 Pressure Treated": ["2x4x10' Sienna Pressure Treated", "2x4x10 Treated"],
+    "Concrete Mix 30kg":       ["Quikrete Concrete Mix", "Concrete Mix 30", "30 kg"],
+    "Drywall Compound":        ["Drywall Compound", "All-Purpose Lite Drywall Compound"],
 }
 
 def normalize_name(name: str) -> str:
@@ -584,13 +731,16 @@ def main():
     console.print(
         "[bold]Construction Material Price Scraper[/bold]\n"
         f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        "Suppliers: Biiibo · IHL Canada · Home Depot CA · RONA\n"
+        "Suppliers: Biiibo · IHL Canada · Home Depot CA · RONA · "
+        "New Canadian Lumber · Downtown Lumber\n"
     )
     all_products = []
     all_products.extend(scrape_biiibo())
     all_products.extend(scrape_ihl())
     all_products.extend(scrape_homedepot_playwright())
     all_products.extend(scrape_rona_playwright())
+    all_products.extend(scrape_new_canadian_lumber())
+    all_products.extend(scrape_downtown_lumber())
 
     console.print(f"\n[bold]Total products scraped:[/bold] {len(all_products)}")
 
